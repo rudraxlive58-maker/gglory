@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # ═══════════════════════════════════════════════════════════════════
-#  TEAM RBC — MERGED BEST (Squad Sync + Full Movement + Rate Limit Safe)
+#  TEAM RBC — FAST MATCH (2-Min Auto-Exit)
 # ═══════════════════════════════════════════════════════════════════
 import sys, asyncio, httpx, random, json, socket, struct, time, os, uuid
 import itertools, secrets, traceback, base64, math
@@ -25,7 +25,7 @@ import thunderFF_pb2
 
 from dashboard_server import bot_state, start_web_dashboard
 
-# ═══════════════════════════ CONFIG (RATE LIMIT SAFE) ═══════════════════════════
+# ═══════════════════════════ CONFIG (FAST MATCH) ═══════════════════════════
 WEB_HOST = "0.0.0.0"
 WEB_PORT = 20333
 ACCOUNTS_FILE = "accounts.json"
@@ -33,23 +33,24 @@ TOKEN_CACHE_FILE = "token_cache.json"
 DEVICES_FILE = "devices.json"
 TOKEN_CACHE_TTL = 4500
 
+# ⭐ FAST MATCH CONFIG
+MAX_MATCH_DURATION      = 150.0     # 2.5 min hard cap
+IN_GAME_DURATION        = 120.0     # 2 min in-game timer
+MATCH_IDLE_TIMEOUT      = 45.0      # 45s idle
+NEW_MATCH_DELAY         = 8.0       # 8s reconnect
 START_MATCH_INTERVAL    = 8.0
-NEW_MATCH_DELAY         = 12.0
-MAX_MATCH_DURATION      = 3000
-MATCH_IDLE_TIMEOUT      = 90.0
+
 EXP_REFRESH_INTERVAL    = 45.0
-EXP_REFRESH_AFTER_MATCH_DELAY = 12.0
+EXP_REFRESH_AFTER_MATCH_DELAY = 10.0
 MAX_CONSECUTIVE_PARSE_FAILURES = 5
 NON_MATCH_RECONNECT_DELAY      = 3.0
 
-# ⭐ Battle Royale
 BR_MODE_ID = 1
 BR_MAP_ID  = 1
 
 ANTI_AFK_MIN_INTERVAL  = 1.8
 ANTI_AFK_MAX_INTERVAL  = 3.5
 
-# ⭐ Rate limit safe search
 MATCH_SEARCH_TIMEOUT   = 90.0
 MATCH_WATCHDOG_CHECK   = 30.0
 REGION_ROTATION_LIST   = ["ID", "SG", "TH", "MY"]
@@ -62,14 +63,14 @@ BYPASS_PACKET_JITTER  = True
 BYPASS_HELLO_DELAY    = True
 BYPASS_KA_JITTER      = True
 
-# ⭐ Movement (Code 1 state machine + bounded radius)
+# Movement
 ENABLE_SPEED_MOVEMENT       = True
 MOVEMENT_SPEED_MIN          = 1.0
 MOVEMENT_SPEED_MAX          = 1.4
 MOVEMENT_PATTERN            = "circle"
 MOVEMENT_TICK_MS            = 240
 MOVEMENT_RADIUS             = 180
-MOVEMENT_MAX_COORD          = 4000      # ⭐ map boundary clamp
+MOVEMENT_MAX_COORD          = 4000
 MOVEMENT_UPDATE_SPEED_EVERY = 4.0
 MOVEMENT_STATE_IDLE_CHANCE   = 0.10
 MOVEMENT_STATE_WALK_CHANCE   = 0.28
@@ -79,7 +80,6 @@ MOVEMENT_STATE_JUMP_CHANCE   = 0.08
 MOVEMENT_STATE_CROUCH_CHANCE = 0.06
 MOVEMENT_STATE_PRONE_CHANCE  = 0.06
 
-# ⭐ Ping OFF (Code 2 decision — in-game stability)
 ENABLE_HTTP_PING = False
 PING_INTERVAL    = 20.0
 PING_TIMEOUT     = 8.0
@@ -104,8 +104,7 @@ TEAM_READY_DELAY        = 5.0
 _accept_friend_request  = True
 DEBUG_TEAM_PACKETS      = False
 
-# ⭐ Squad dead-sync timeout (Code 2 had 360s = waste; here 180s)
-SQUAD_ALL_DEAD_TIMEOUT = 180.0
+SQUAD_ALL_DEAD_TIMEOUT = 60.0
 
 # ═══════════════════════════ RATE LIMIT HELPERS ═══════════════════════════
 _rate_limit_state = {"429_count": 0, "last_429": 0.0, "cooldown_until": 0.0}
@@ -129,7 +128,7 @@ def reset_429():
     _rate_limit_state["429_count"] = 0
     _rate_limit_state["cooldown_until"] = 0.0
 
-# ═══════════════════════════ SQUAD MATCH SYNC (Code 2 best) ═══════════════════════════
+# ═══════════════════════════ SQUAD MATCH SYNC ═══════════════════════════
 class SquadMatchSync:
     def __init__(self):
         self.lock = asyncio.Lock()
@@ -142,7 +141,7 @@ class SquadMatchSync:
             self.active_squad_uids = set(str(u) for u in uids)
             self.dead_squad_uids.clear()
             self.all_dead_event.clear()
-            print_info(f"[SQUAD SYNC] Match started with {len(self.active_squad_uids)} active bots.")
+            print_info(f"[SQUAD SYNC] Match started with {len(self.active_squad_uids)} bots.")
 
     async def mark_bot_dead(self, uid: str):
         async with self.lock:
@@ -161,12 +160,10 @@ class SquadMatchSync:
         except asyncio.TimeoutError:
             print_warning(f"[SQUAD SYNC] Timeout {timeout}s — backing out.")
 
-# ⭐ Per-match sync (not global — Code 1 fix)
 def _new_squad_sync():
     return SquadMatchSync()
 
 def purge_extra_accounts_from_file(keep_uids: set):
-    """⭐ Safe version — backup first (Code 2 was destructive)."""
     if not os.path.exists(ACCOUNTS_FILE): return
     try:
         keep_uids_str = set(str(u) for u in keep_uids)
@@ -177,8 +174,7 @@ def purge_extra_accounts_from_file(keep_uids: set):
         filtered = [acc for acc in data
                     if str(acc.get("uid", "")) in keep_uids_str
                     or str(acc.get("account_id", "")) in keep_uids_str]
-        # Only purge if difference is exactly extras (not all wiped)
-        if len(filtered) == 0: 
+        if len(filtered) == 0:
             print_warning("[CLEANUP] Skip — would wipe all accounts")
             return
         os.rename(ACCOUNTS_FILE, backup)
@@ -206,7 +202,6 @@ def bypass_ka_jitter(base=5.0):
     return max(3.0, base + random.uniform(-0.8, 1.2))
 
 def bypass_human_reconnect_delay(attempt):
-    # ⭐ Rate limit fix: 0.5 → 2.5
     if not (SAFE_PLAY_MODE and BYPASS_TIMING_JITTER):
         return min(attempt * 2.5, 8.0)
     return max(0.5, min(attempt * 2.5, 8.0) + random.uniform(-1.0, 2.0))
@@ -380,7 +375,7 @@ async def _get_total_match_count():
     async with _match_counter_lock:
         return sum(_match_counters.values())
 
-# ═══════════════════════════ SQUAD STATE (Code 1 + Code 2 merged) ═══════════════════════════
+# ═══════════════════════════ SQUAD STATE ═══════════════════════════
 _team_state = {
     "peers": {},
     "leader_uid": None,
@@ -862,7 +857,7 @@ async def send_getlogin(data, base_url, token, release_version):
         return None
     except Exception: return None
 
-# ═══════════════════════════ HTTP PING (disabled but code present) ═══════════════════════════
+# ═══════════════════════════ HTTP PING ═══════════════════════════
 async def send_ping(account_id, token, release_version):
     try:
         try: acc = int(account_id)
@@ -951,7 +946,8 @@ BR_HEX = (
 async def start_game_battle_royale(region, client_version, writer, key, iv):
     packet = bytes.fromhex(BR_HEX)
     try:
-        proto = CguFF_pb2.StartMatch(); proto.ParseFromString(packet)
+        proto = thunderFF_pb2.StartMatch()
+        proto.ParseFromString(packet)
         if hasattr(proto.main, 'region_list') and len(proto.main.region_list) > 0:
             proto.main.region_list[0].region = region
             if len(proto.main.region_list) > 1: proto.main.region_list[1].region = region
@@ -1235,7 +1231,7 @@ async def build_match_startup_packets(token, udp_key, match_code, account_id, bl
     loading = await sv_frame(0x5A, match_code, 2, 448, 1, 1, tg, udp_key)
     return process.hex(), loading.hex()
 
-# ═══════════════════════════ MOVEMENT 2001 (Code 1 state machine + Code 2 map roam + bounded) ═══════════════════════════
+# ═══════════════════════════ MOVEMENT 2001 ═══════════════════════════
 async def build_movement_packet_2001(key_bytes, msg_key, player_state, x, y, z,
                                      tick, counter, move_state, account_uid,
                                      room_code, phase="game"):
@@ -1268,7 +1264,6 @@ async def build_movement_packet_2001(key_bytes, msg_key, player_state, x, y, z,
     return bytes(h) + body
 
 class MovementTracker:
-    """⭐ Code 1 state machine + Code 2 map roam + boundary clamp."""
     PLAYER_STATE = {"idle": 0, "walk": 1, "run": 2, "sprint": 3, "jump": 4, "crouch": 5, "prone": 6}
 
     def __init__(self, pattern="circle", radius=180):
@@ -1278,15 +1273,12 @@ class MovementTracker:
         self.counter = 0
         self.angle = random.uniform(0, 6.2832)
         self.dir_flip = 1
-        # ⭐ Code 2 roam coords
         self.curr_x = random.randint(-400, 400)
         self.curr_y = 15
         self.curr_z = random.randint(-400, 400)
-        # ⭐ Code 1 speed multiplier
         self.speed_multiplier = 1.0
         self._next_speed_roll = time.time()
         self._roll_new_speed()
-        # ⭐ Code 1 state machine
         self.state = "walk"
         self.state_start = time.time()
         self.state_duration = random.uniform(2.0, 4.0)
@@ -1317,7 +1309,6 @@ class MovementTracker:
         else: return "prone", random.uniform(1.5, 3.5)
 
     def _clamp(self, v):
-        # ⭐ Code 2 fix: map boundary clamp
         m = MOVEMENT_MAX_COORD
         return max(-m, min(v, m))
 
@@ -1330,9 +1321,7 @@ class MovementTracker:
         dz = int(step * math.sin(self.angle))
         self.curr_x = self._clamp(self.curr_x + dx)
         self.curr_z = self._clamp(self.curr_z + dz)
-        # Random direction flip 3% of time
         if random.random() < 0.03: self.dir_flip *= -1
-        # Bounce off boundary
         if abs(self.curr_x) >= MOVEMENT_MAX_COORD - 50: self.dir_flip *= -1
         if abs(self.curr_z) >= MOVEMENT_MAX_COORD - 50: self.dir_flip *= -1
         return self.curr_x, self.curr_y, self.curr_z, 0x0F
@@ -1344,8 +1333,6 @@ class MovementTracker:
             old = self.state
             self.state, self.state_duration = self._pick_next_state()
             self.state_start = now
-            if old != self.state:
-                print_info(f"[MOVE] {old} -> {self.state} ({self.state_duration:.2f}s)")
         self.tick = (self.tick + 1) & 0xFFFFFFFF
         self.counter = (self.counter + 1) & 0xFFFFFFFF
         ps = self.PLAYER_STATE.get(self.state, 1)
@@ -1367,7 +1354,6 @@ async def movement_worker(sock, ip, port, udp_key_bytes, match_code, account_id,
                 pkt = await build_movement_packet_2001(udp_key_bytes, 0x6B, ps, x, y, z, tick, cnt, ms,
                                                        account_id, match_code, phase="game")
                 await loop.sock_sendto(sock, pkt, addr); sent += 1
-                if sent % 30 == 0: print_info(f"[MOVE] #{match_index} sent={sent} {st}({ps}) rate={sm}x")
                 base = MOVEMENT_TICK_MS / 1000.0
                 try: smx = max(0.7, min(float(sm), 1.6))
                 except Exception: smx = 1.0
@@ -1378,7 +1364,6 @@ async def movement_worker(sock, ip, port, udp_key_bytes, match_code, account_id,
             except asyncio.CancelledError: break
             except Exception: await asyncio.sleep(0.5)
     except asyncio.CancelledError: pass
-    finally: print_info(f"[MOVE] #{match_index} stopped sent={sent}")
 
 async def send_anti_afk_fire(sock, addr, udp_key_bytes, match_code, account_id):
     try:
@@ -1412,17 +1397,15 @@ async def anti_afk_worker(sock, ip, port, udp_key_bytes, match_code, account_id,
             except asyncio.CancelledError: break
             except Exception: await asyncio.sleep(1.0)
     except asyncio.CancelledError: pass
-    finally:
-        if fires > 0: print_info(f"[AFK] #{match_index} Fires={fires}")
 
-# ═══════════════════════════ PLAY GAME (with per-match sync) ═══════════════════════════
+# ═══════════════════════════ PLAY GAME (FAST EXIT) ═══════════════════════════
 async def play_game(server_ip_port, thunder, sharma, udp_key, match_code,
                     account_id, player_region, client_version, key, iv,
                     match_index, squad_sync=None, on_match_complete=None):
-    """⭐ Per-match squad_sync (not global — Code 1 fix)."""
     if squad_sync is None:
         squad_sync = SquadMatchSync()
     t0 = time.time()
+    in_game_started_at = None  # ⭐ TIMER START AFTER THUNDER/SHARMA
     ping_task = anti_task = move_task = None
     sock = None
     ping_stop = asyncio.Event(); anti_stop = asyncio.Event(); move_stop = asyncio.Event()
@@ -1444,7 +1427,7 @@ async def play_game(server_ip_port, thunder, sharma, udp_key, match_code,
         send_lock = asyncio.Lock(); anti_started = False
         ping_task = asyncio.create_task(keepalive_ping(sock, rip, port, udp_key_bytes, match_code, ping_stop))
         last_activity = time.time()
-        print_colored(f"[MATCH #{match_index}] UDP -> {server_ip_port} (DNS:{rip})", Colors.MAGENTA)
+        print_colored(f"[MATCH #{match_index}] UDP -> {server_ip_port} (FAST MODE — {IN_GAME_DURATION}s)", Colors.MAGENTA)
 
         async def start_workers():
             nonlocal anti_task, move_task, anti_started
@@ -1459,7 +1442,7 @@ async def play_game(server_ip_port, thunder, sharma, udp_key, match_code,
                 print_success(f"[MOVE] Worker #{match_index} | {MOVEMENT_PATTERN}")
 
         async def send_startup():
-            nonlocal ack_state, thunder_sent
+            nonlocal ack_state, thunder_sent, in_game_started_at
             if thunder_sent: return
             async with send_lock:
                 if thunder_sent: return
@@ -1473,12 +1456,34 @@ async def play_game(server_ip_port, thunder, sharma, udp_key, match_code,
                     await asyncio.sleep(bypass_jitter(0.2, 0.05))
                     await loop.sock_sendto(sock, bytes.fromhex(sharma), (rip, port))
                     ack_state = "thunder_sharma_sent"
-                    print_success(f"[MATCH #{match_index}] Startup delivered")
+                    in_game_started_at = time.time()  # ⭐ TIMER START
+                    print_success(f"[MATCH #{match_index}] In-game timer started — will exit after {IN_GAME_DURATION}s")
                     await start_workers()
                 except Exception as e: print_error(f"[MATCH #{match_index}] startup: {e}")
 
         while not local_closed:
-            if time.time() - t0 > MAX_MATCH_DURATION: break
+            # Hard cap
+            if time.time() - t0 > MAX_MATCH_DURATION:
+                print_warning(f"[MATCH #{match_index}] Hard cap {MAX_MATCH_DURATION}s reached")
+                completed = True
+                is_dead = True
+                await squad_sync.mark_bot_dead(uid_str)
+                break
+
+            # ⭐ FAST EXIT — 2 min timer
+            if in_game_started_at:
+                elapsed = time.time() - in_game_started_at
+                if elapsed >= IN_GAME_DURATION:
+                    print_success(f"[MATCH #{match_index}] ⏰ {int(elapsed)}s done — fast exit")
+                    completed = True
+                    is_dead = True
+                    await squad_sync.mark_bot_dead(uid_str)
+                    try:
+                        if sock: sock.close()
+                    except Exception: pass
+                    local_closed = True
+                    break
+
             try:
                 resp, saddr = await asyncio.wait_for(loop.sock_recvfrom(sock, 65535), timeout=1.5)
                 if resp:
@@ -1551,9 +1556,13 @@ async def play_game(server_ip_port, thunder, sharma, udp_key, match_code,
                 except Exception: pass
 
         if is_dead:
-            print_info(f"[MATCH #{match_index}] Bot {uid_str} waiting for squad dead-sync...")
-            await squad_sync.wait_for_all_dead()
-            print_success(f"[MATCH #{match_index}] Bot {uid_str} leaving after squad death!")
+            # ⭐ Timer exit — wait nahi karo
+            if in_game_started_at and (time.time() - in_game_started_at) >= IN_GAME_DURATION:
+                print_info(f"[MATCH #{match_index}] Timer exit — no squad wait")
+            else:
+                print_info(f"[MATCH #{match_index}] Bot {uid_str} waiting squad dead-sync...")
+                await squad_sync.wait_for_all_dead()
+            print_success(f"[MATCH #{match_index}] Bot {uid_str} leaving!")
         return f"match #{match_index} finished"
     except Exception as e:
         print_error(f"[MATCH #{match_index}] {e}")
@@ -1660,18 +1669,15 @@ def _wrap_manual(inner):
     except Exception: pass
     return None
 
-# ═══════════════════════════ TEAM INVITE HANDLER (Code 1 cmd-based fix) ═══════════════════════════
+# ═══════════════════════════ TEAM INVITE HANDLER ═══════════════════════════
 async def _handle_team_invite(hex_data, pl, uid_str, current_account_data,
                               current_key, current_iv, writer):
     try:
         if DEBUG_TEAM_PACKETS:
             print_info(f"[TEAM-IN {uid_str}] len={pl} hex={hex_data[:80]}")
-
-        # ⭐ Code 1 fix: skip if we are the leader
         async with _team_state["lock"]:
             is_leader = (_team_state["leader_uid"] == uid_str)
         if is_leader:
-            if DEBUG_TEAM_PACKETS: print_info(f"[TEAM-IN {uid_str}] skip — we are leader")
             return False
 
         candidates = []
@@ -1797,7 +1803,6 @@ async def functional_battle_royale(addrs, starter_packet, account_region, client
             if cd: await refresh_account_profile(cd)
         except Exception: pass
 
-    # ═══════ LEADER: create → invite → ready → start ═══════
     async def _team_coordinator():
         try:
             deadline = time.time() + TEAM_PEER_WAIT_TIMEOUT
@@ -1914,14 +1919,13 @@ async def functional_battle_royale(addrs, starter_packet, account_region, client
                 print_error(f"[TEAM] Only {final_cnt}/{TEAM_SIZE} joined — abort retry")
                 return
 
-            # ⭐ Safe purge with backup
             async with _team_state["members_lock"]:
                 group_4_uids = set(_team_state["members"])
             purge_extra_accounts_from_file(group_4_uids)
 
             await asyncio.sleep(TEAM_FINAL_WAIT)
 
-            print_success(f"[TEAM] 🚀 {uid_str} loop: ready → 1s → start (every 10s)")
+            print_success(f"[TEAM] 🚀 {uid_str} loop: ready → 1.5s → start (every 10s)")
             while _team_active["flag"]:
                 try:
                     if bot_state.is_paused(uid_str): break
@@ -1941,7 +1945,7 @@ async def functional_battle_royale(addrs, starter_packet, account_region, client
                     if _writer_ref["w"] and not _writer_ref["w"].is_closing():
                         _writer_ref["w"].write(sm); await _writer_ref["w"].drain()
                 except Exception as e: print_warning(f"[TEAM] start err: {e}")
-                try: await asyncio.wait_for(asyncio.sleep(10.0), timeout=10.5)
+                try: await asyncio.wait_for(asyncio.sleep(START_MATCH_INTERVAL), timeout=START_MATCH_INTERVAL + 0.5)
                 except asyncio.TimeoutError: pass
         except asyncio.CancelledError: raise
         except Exception as e:
@@ -1993,7 +1997,7 @@ async def functional_battle_royale(addrs, starter_packet, account_region, client
                         sm = start_match_team(int(my_id), current_key, current_iv, region=account_region)
                         _writer_ref["w"].write(sm); await _writer_ref["w"].drain()
                 except Exception as e: print_warning(f"[TEAM] member trigger: {e}")
-                try: await asyncio.wait_for(asyncio.sleep(10.0), timeout=10.5)
+                try: await asyncio.wait_for(asyncio.sleep(START_MATCH_INTERVAL), timeout=START_MATCH_INTERVAL + 0.5)
                 except asyncio.TimeoutError: pass
         except asyncio.CancelledError: raise
         except Exception as e: print_warning(f"[TEAM] member outer: {e}")
@@ -2064,7 +2068,7 @@ async def functional_battle_royale(addrs, starter_packet, account_region, client
                 current_search_region = REGION_ROTATION_LIST[region_index]
                 print_warning(f"[REGION ROTATE] {uid_str} -> {current_search_region}")
 
-            print_success(f"[FUNC] TCP connected {uid_str} (DNS:{rip} Lvl:{current_level} R:{current_search_region})")
+            print_success(f"[FUNC] TCP connected {uid_str} (DNS:{rip} Lvl:{current_level} R:{current_search_region}) FAST")
             reconnects = 0; no_response_count = 0
 
             async with _team_state["lock"]:
@@ -2123,7 +2127,6 @@ async def functional_battle_royale(addrs, starter_packet, account_region, client
                     await _process_social_packet(data, current_account_data, tag="MAIN")
                     continue
 
-                # ⭐ Code 1 fix: "05" only for team, but also verify cmd byte
                 if hex_data.startswith("05") and pl > 10:
                     await _handle_team_invite(hex_data, pl, uid_str, current_account_data,
                                               current_key, current_iv, writer)
@@ -2131,7 +2134,7 @@ async def functional_battle_royale(addrs, starter_packet, account_region, client
 
                 if hex_data.startswith("0300") and pl >= 300:
                     print_colored("=" * 60, Colors.GREEN)
-                    print_colored("MATCH FOUND! Loading...", Colors.GREEN)
+                    print_colored("MATCH FOUND! Loading... (FAST MODE)", Colors.GREEN)
                     print_colored("=" * 60, Colors.GREEN)
 
                     for tk in (team_coord_task, member_trigger_task):
@@ -2161,7 +2164,6 @@ async def functional_battle_royale(addrs, starter_packet, account_region, client
 
                         effective = match_account_id or account_id or "BD_BOT"
                         if token and udp_key and match_code and server_ip_port:
-                            # ⭐ Per-match sync instance
                             match_sync = _new_squad_sync()
                             async with _team_state["lock"]:
                                 all_peers = list(_team_state["peers"].keys())
@@ -2176,7 +2178,7 @@ async def functional_battle_royale(addrs, starter_packet, account_region, client
                                 mode_id=BR_MODE_ID, map_id=BR_MAP_ID)
                             match_index = await _inc_match(uid_str)
                             total = await _get_total_match_count()
-                            print_colored(f"[MATCH #{match_index}] UDP -> {server_ip_port} | Total:{total}", Colors.CYAN)
+                            print_colored(f"[MATCH #{match_index}] UDP -> {server_ip_port} | Total:{total} | FAST", Colors.CYAN)
 
                             new_match = asyncio.create_task(play_game(
                                 server_ip_port, thunder, sharma, udp_key, match_code,
@@ -2412,7 +2414,7 @@ async def process_account_uid_pass(uid, password):
         region = mresp.region or get_proto_field(dd, 3, "ID")
         bot_state.register_account(uid=acc_id, nickname=nick, region=region,
                                     level=level, exp=exp, likes=likes)
-        print_success(f"[OK] {acc_id} | {nick} | Lvl{level} | BATTLE ROYALE")
+        print_success(f"[OK] {acc_id} | {nick} | Lvl{level} | FAST MODE")
         ad = {
             'account_id': mresp.account_id, 'nickname': nick, 'region': region,
             'level': level, 'exp': exp, 'likes': likes,
@@ -2588,10 +2590,10 @@ def load_accounts():
 # ═══════════════════════════ MAIN ═══════════════════════════
 async def main():
     print_colored("=" * 60, Colors.CYAN)
-    print_colored("  TEAM RBC — MERGED BEST (Squad + Movement + Safe)", Colors.GREEN)
+    print_colored("  TEAM RBC — FAST MATCH (2-Min Auto-Exit)", Colors.GREEN)
     print_colored("=" * 60, Colors.CYAN)
-    print_info(f"Match interval: {START_MATCH_INTERVAL}s | Offline: {NEW_MATCH_DELAY}s")
-    print_info("Mode: BATTLE ROYALE ONLY | Region: ID (fallback rotate)")
+    print_info(f"In-game: {IN_GAME_DURATION}s | Reconnect: {NEW_MATCH_DELAY}s")
+    print_info("Mode: BATTLE ROYALE — FAST MODE")
     if TEAM_MODE:
         print_success(f"[SQUAD] size={TEAM_SIZE} peer_wait={TEAM_PEER_WAIT_TIMEOUT}s")
     print_colored("=" * 60, Colors.CYAN)
