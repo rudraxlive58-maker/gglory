@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # ═══════════════════════════════════════════════════════════════════
-#  TEAM RBC — FAST MATCH (2-Min Auto-Exit)
+#  TEAM RBC — GLORY FARM (Long Match + Squad Sync + Safe)
 # ═══════════════════════════════════════════════════════════════════
 import sys, asyncio, httpx, random, json, socket, struct, time, os, uuid
 import itertools, secrets, traceback, base64, math
@@ -25,7 +25,7 @@ import thunderFF_pb2
 
 from dashboard_server import bot_state, start_web_dashboard
 
-# ═══════════════════════════ CONFIG (FAST MATCH) ═══════════════════════════
+# ═══════════════════════════ CONFIG (GLORY FARM) ═══════════════════════════
 WEB_HOST = "0.0.0.0"
 WEB_PORT = 20333
 ACCOUNTS_FILE = "accounts.json"
@@ -33,25 +33,26 @@ TOKEN_CACHE_FILE = "token_cache.json"
 DEVICES_FILE = "devices.json"
 TOKEN_CACHE_TTL = 4500
 
-# ⭐ FAST MATCH CONFIG
-MAX_MATCH_DURATION      = 150.0     # 2.5 min hard cap
-IN_GAME_DURATION        = 120.0     # 2 min in-game timer
-MATCH_IDLE_TIMEOUT      = 45.0      # 45s idle
-NEW_MATCH_DELAY         = 8.0       # 8s reconnect
-START_MATCH_INTERVAL    = 8.0
+# ⭐ GLORY FARM — Long match, natural finish
+MAX_MATCH_DURATION      = 1800.0    # 30 min hard cap (glory ke liye lamba)
+MATCH_IDLE_TIMEOUT      = 180.0     # 3 min idle (natural death/end)
+NEW_MATCH_DELAY         = 12.0      # 12s reconnect (rate limit safe)
+START_MATCH_INTERVAL    = 10.0
 
-EXP_REFRESH_INTERVAL    = 45.0
-EXP_REFRESH_AFTER_MATCH_DELAY = 10.0
+EXP_REFRESH_INTERVAL    = 60.0
+EXP_REFRESH_AFTER_MATCH_DELAY = 15.0
 MAX_CONSECUTIVE_PARSE_FAILURES = 5
 NON_MATCH_RECONNECT_DELAY      = 3.0
 
+# ⭐ Battle Royale
 BR_MODE_ID = 1
 BR_MAP_ID  = 1
 
-ANTI_AFK_MIN_INTERVAL  = 1.8
-ANTI_AFK_MAX_INTERVAL  = 3.5
+ANTI_AFK_MIN_INTERVAL  = 2.0
+ANTI_AFK_MAX_INTERVAL  = 4.0
 
-MATCH_SEARCH_TIMEOUT   = 90.0
+# ⭐ Rate limit safe search
+MATCH_SEARCH_TIMEOUT   = 120.0
 MATCH_WATCHDOG_CHECK   = 30.0
 REGION_ROTATION_LIST   = ["ID", "SG", "TH", "MY"]
 REGION_ROTATE_EVERY_N  = 2
@@ -63,7 +64,7 @@ BYPASS_PACKET_JITTER  = True
 BYPASS_HELLO_DELAY    = True
 BYPASS_KA_JITTER      = True
 
-# Movement
+# ⭐ Movement
 ENABLE_SPEED_MOVEMENT       = True
 MOVEMENT_SPEED_MIN          = 1.0
 MOVEMENT_SPEED_MAX          = 1.4
@@ -80,6 +81,7 @@ MOVEMENT_STATE_JUMP_CHANCE   = 0.08
 MOVEMENT_STATE_CROUCH_CHANCE = 0.06
 MOVEMENT_STATE_PRONE_CHANCE  = 0.06
 
+# ⭐ Ping OFF (in-game stability)
 ENABLE_HTTP_PING = False
 PING_INTERVAL    = 20.0
 PING_TIMEOUT     = 8.0
@@ -104,7 +106,8 @@ TEAM_READY_DELAY        = 5.0
 _accept_friend_request  = True
 DEBUG_TEAM_PACKETS      = False
 
-SQUAD_ALL_DEAD_TIMEOUT = 60.0
+# ⭐ Squad sync — jab tak 4/4 dead nahi, wait (glory ke liye)
+SQUAD_ALL_DEAD_TIMEOUT = 600.0   # 10 min max wait
 
 # ═══════════════════════════ RATE LIMIT HELPERS ═══════════════════════════
 _rate_limit_state = {"429_count": 0, "last_429": 0.0, "cooldown_until": 0.0}
@@ -1398,14 +1401,13 @@ async def anti_afk_worker(sock, ip, port, udp_key_bytes, match_code, account_id,
             except Exception: await asyncio.sleep(1.0)
     except asyncio.CancelledError: pass
 
-# ═══════════════════════════ PLAY GAME (FAST EXIT) ═══════════════════════════
+# ═══════════════════════════ PLAY GAME (GLORY — natural finish) ═══════════════════════════
 async def play_game(server_ip_port, thunder, sharma, udp_key, match_code,
                     account_id, player_region, client_version, key, iv,
                     match_index, squad_sync=None, on_match_complete=None):
     if squad_sync is None:
         squad_sync = SquadMatchSync()
     t0 = time.time()
-    in_game_started_at = None  # ⭐ TIMER START AFTER THUNDER/SHARMA
     ping_task = anti_task = move_task = None
     sock = None
     ping_stop = asyncio.Event(); anti_stop = asyncio.Event(); move_stop = asyncio.Event()
@@ -1427,7 +1429,7 @@ async def play_game(server_ip_port, thunder, sharma, udp_key, match_code,
         send_lock = asyncio.Lock(); anti_started = False
         ping_task = asyncio.create_task(keepalive_ping(sock, rip, port, udp_key_bytes, match_code, ping_stop))
         last_activity = time.time()
-        print_colored(f"[MATCH #{match_index}] UDP -> {server_ip_port} (FAST MODE — {IN_GAME_DURATION}s)", Colors.MAGENTA)
+        print_colored(f"[MATCH #{match_index}] UDP -> {server_ip_port} (GLORY MODE)", Colors.MAGENTA)
 
         async def start_workers():
             nonlocal anti_task, move_task, anti_started
@@ -1442,7 +1444,7 @@ async def play_game(server_ip_port, thunder, sharma, udp_key, match_code,
                 print_success(f"[MOVE] Worker #{match_index} | {MOVEMENT_PATTERN}")
 
         async def send_startup():
-            nonlocal ack_state, thunder_sent, in_game_started_at
+            nonlocal ack_state, thunder_sent
             if thunder_sent: return
             async with send_lock:
                 if thunder_sent: return
@@ -1456,34 +1458,18 @@ async def play_game(server_ip_port, thunder, sharma, udp_key, match_code,
                     await asyncio.sleep(bypass_jitter(0.2, 0.05))
                     await loop.sock_sendto(sock, bytes.fromhex(sharma), (rip, port))
                     ack_state = "thunder_sharma_sent"
-                    in_game_started_at = time.time()  # ⭐ TIMER START
-                    print_success(f"[MATCH #{match_index}] In-game timer started — will exit after {IN_GAME_DURATION}s")
+                    print_success(f"[MATCH #{match_index}] In-game — glory mode (natural finish)")
                     await start_workers()
                 except Exception as e: print_error(f"[MATCH #{match_index}] startup: {e}")
 
         while not local_closed:
-            # Hard cap
-            if time.time() - t0 > MAX_MATCH_DURATION:
+            if time.time() - t0 > MAX_MATCH_DURATION: 
                 print_warning(f"[MATCH #{match_index}] Hard cap {MAX_MATCH_DURATION}s reached")
                 completed = True
                 is_dead = True
                 await squad_sync.mark_bot_dead(uid_str)
                 break
-
-            # ⭐ FAST EXIT — 2 min timer
-            if in_game_started_at:
-                elapsed = time.time() - in_game_started_at
-                if elapsed >= IN_GAME_DURATION:
-                    print_success(f"[MATCH #{match_index}] ⏰ {int(elapsed)}s done — fast exit")
-                    completed = True
-                    is_dead = True
-                    await squad_sync.mark_bot_dead(uid_str)
-                    try:
-                        if sock: sock.close()
-                    except Exception: pass
-                    local_closed = True
-                    break
-
+            
             try:
                 resp, saddr = await asyncio.wait_for(loop.sock_recvfrom(sock, 65535), timeout=1.5)
                 if resp:
@@ -1556,13 +1542,9 @@ async def play_game(server_ip_port, thunder, sharma, udp_key, match_code,
                 except Exception: pass
 
         if is_dead:
-            # ⭐ Timer exit — wait nahi karo
-            if in_game_started_at and (time.time() - in_game_started_at) >= IN_GAME_DURATION:
-                print_info(f"[MATCH #{match_index}] Timer exit — no squad wait")
-            else:
-                print_info(f"[MATCH #{match_index}] Bot {uid_str} waiting squad dead-sync...")
-                await squad_sync.wait_for_all_dead()
-            print_success(f"[MATCH #{match_index}] Bot {uid_str} leaving!")
+            print_info(f"[MATCH #{match_index}] Bot {uid_str} waiting squad dead-sync...")
+            await squad_sync.wait_for_all_dead()
+            print_success(f"[MATCH #{match_index}] Bot {uid_str} leaving after squad death!")
         return f"match #{match_index} finished"
     except Exception as e:
         print_error(f"[MATCH #{match_index}] {e}")
@@ -2068,7 +2050,7 @@ async def functional_battle_royale(addrs, starter_packet, account_region, client
                 current_search_region = REGION_ROTATION_LIST[region_index]
                 print_warning(f"[REGION ROTATE] {uid_str} -> {current_search_region}")
 
-            print_success(f"[FUNC] TCP connected {uid_str} (DNS:{rip} Lvl:{current_level} R:{current_search_region}) FAST")
+            print_success(f"[FUNC] TCP connected {uid_str} (DNS:{rip} Lvl:{current_level} R:{current_search_region}) GLORY MODE")
             reconnects = 0; no_response_count = 0
 
             async with _team_state["lock"]:
@@ -2134,7 +2116,7 @@ async def functional_battle_royale(addrs, starter_packet, account_region, client
 
                 if hex_data.startswith("0300") and pl >= 300:
                     print_colored("=" * 60, Colors.GREEN)
-                    print_colored("MATCH FOUND! Loading... (FAST MODE)", Colors.GREEN)
+                    print_colored("MATCH FOUND! Loading... (GLORY MODE)", Colors.GREEN)
                     print_colored("=" * 60, Colors.GREEN)
 
                     for tk in (team_coord_task, member_trigger_task):
@@ -2178,7 +2160,7 @@ async def functional_battle_royale(addrs, starter_packet, account_region, client
                                 mode_id=BR_MODE_ID, map_id=BR_MAP_ID)
                             match_index = await _inc_match(uid_str)
                             total = await _get_total_match_count()
-                            print_colored(f"[MATCH #{match_index}] UDP -> {server_ip_port} | Total:{total} | FAST", Colors.CYAN)
+                            print_colored(f"[MATCH #{match_index}] UDP -> {server_ip_port} | Total:{total} | GLORY", Colors.CYAN)
 
                             new_match = asyncio.create_task(play_game(
                                 server_ip_port, thunder, sharma, udp_key, match_code,
@@ -2414,7 +2396,7 @@ async def process_account_uid_pass(uid, password):
         region = mresp.region or get_proto_field(dd, 3, "ID")
         bot_state.register_account(uid=acc_id, nickname=nick, region=region,
                                     level=level, exp=exp, likes=likes)
-        print_success(f"[OK] {acc_id} | {nick} | Lvl{level} | FAST MODE")
+        print_success(f"[OK] {acc_id} | {nick} | Lvl{level} | GLORY MODE")
         ad = {
             'account_id': mresp.account_id, 'nickname': nick, 'region': region,
             'level': level, 'exp': exp, 'likes': likes,
@@ -2590,10 +2572,10 @@ def load_accounts():
 # ═══════════════════════════ MAIN ═══════════════════════════
 async def main():
     print_colored("=" * 60, Colors.CYAN)
-    print_colored("  TEAM RBC — FAST MATCH (2-Min Auto-Exit)", Colors.GREEN)
+    print_colored("  TEAM RBC — GLORY FARM (Long Match + Squad Sync)", Colors.GREEN)
     print_colored("=" * 60, Colors.CYAN)
-    print_info(f"In-game: {IN_GAME_DURATION}s | Reconnect: {NEW_MATCH_DELAY}s")
-    print_info("Mode: BATTLE ROYALE — FAST MODE")
+    print_info(f"Match: natural finish (max {MAX_MATCH_DURATION/60:.0f} min) | Reconnect: {NEW_MATCH_DELAY}s")
+    print_info("Mode: BATTLE ROYALE — GLORY MODE")
     if TEAM_MODE:
         print_success(f"[SQUAD] size={TEAM_SIZE} peer_wait={TEAM_PEER_WAIT_TIMEOUT}s")
     print_colored("=" * 60, Colors.CYAN)
@@ -2646,3 +2628,4 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         print_warning("stopped")
+Isme glory milegi
